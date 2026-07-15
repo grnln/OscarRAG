@@ -50,10 +50,8 @@ class OllamaForSparql(ChatOllama):
             "Rules:\n"
             f"1. Always start with: PREFIX : <{namespace}>\n"
             "2. Output ONLY the SPARQL query — no markdown, no explanation.\n"
-            "3. Use predicates from the ontology to identify entities "
-            "(the data has no rdf:type triples).\n"
-            "4. Prefer direct IRIs (e.g. :BestPicture) over string label filters.\n"
-            "5. If the ontology doesn't cover the question, return a valid SPARQL "
+            "3. Prefer direct IRIs (e.g. :BestPicture) over string label filters.\n"
+            "4. If the ontology doesn't cover the question, return a valid SPARQL "
             "query that yields no results — never invent predicates."
         ))
         result = super()._generate([system] + list(messages), stop, run_manager, **kwargs)

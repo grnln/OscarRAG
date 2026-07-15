@@ -47,7 +47,7 @@ switch between with a radio button:
 
 | Pipeline      | Data source                              | How retrieval works                                                                 |
 | ------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| **Graph RAG** | `ontology/oscars2026.trig` (RDF triples) | LLM writes SPARQL from the ontology → GraphDB runs it → LLM formats the rows        |
+| **Graph RAG** | `ontology/oscars.trig` (schema + data in one file) | LLM writes SPARQL from the ontology → GraphDB runs it → LLM formats the rows        |
 | **Text RAG**  | `ontology/oscar.txt` (film descriptions) | Question is embedded → nearest chunks fetched from Weaviate → LLM answers from them |
 
 The two data sources are **complementary on purpose**:
@@ -256,11 +256,10 @@ Open the GraphDB Workbench in your browser: **http://localhost:7200**.
 
 1. Left sidebar → **Import** → **User data** tab.
 2. Click **Upload RDF files**.
-3. Select `ontology/oscars2026.trig` from the repo folder.
+3. Select `ontology/oscars.trig` from the repo folder.
 4. Click **Import** on the file's row. Wait for it to say `Imported successfully`.
-5. Repeat for `ontology/award_labels.trig`.
 
-**You should see:** two entries in the "Recent imports" table, both green.
+**You should see:** one entry in the "Recent imports" table, green. The file contains both the schema (classes and properties) and the individuals (films, people, awards) — no separate labels file is needed.
 
 ### 6.4 Verify with a SPARQL query
 
@@ -322,7 +321,7 @@ Open `.env` in a text editor. Confirm each value matches your setup.
 | ----------------------- | --------------------------------------------------- | ---------------------------------------- |
 | `GRAPHDB_URL`           | Where GraphDB listens                               | `http://localhost:7200`                  |
 | `GRAPHDB_REPOSITORY`    | Repository ID you created in §6.1                   | `BIP-DB`                                 |
-| `GRAPHDB_ONTOLOGY_FILE` | TTL file the LLM reads to know the graph's shape    | `ontology/oscar_schema.ttl`              |
+| `GRAPHDB_ONTOLOGY_FILE` | Ontology file the LLM reads to know the graph's shape | `ontology/oscars.trig`                 |
 | `GRAPHDB_NAMESPACE`     | Namespace pinned into every generated SPARQL PREFIX | `http://oscars2026.org#`                 |
 | `OLLAMA_MODEL`          | Local model tag — must match `ollama list`          | `qwen2.5-coder:7b`                       |
 | `WEAVIATE_COLLECTION`   | Collection name in Weaviate                         | `OscarFilms`                             |
@@ -522,9 +521,9 @@ require any code change.
 
 ### 14.1 Add more triples (grow the knowledge graph)
 
-1. Extend `ontology/oscars2026.trig` (or drop a new `.trig` file into `ontology/`).
+1. Extend `ontology/oscars.trig` (add new individuals inside the `:oscars2026 { … }` block) or drop a new `.trig` file into `ontology/`.
 2. In the GraphDB Workbench: **Import → User data → Upload RDF files** — same as §6.3.
-3. If you introduced **new predicates**, update `ontology/oscar_schema.ttl` so the LLM knows about them. Otherwise it will keep writing SPARQL using only the old vocabulary.
+3. If you introduced **new predicates or classes**, add them to the T-Box (schema) section at the top of `ontology/oscars.trig` so the LLM knows about them. Otherwise it will keep writing SPARQL using only the old vocabulary.
 4. No restart needed. GraphDB serves the new data immediately.
 
 ### 14.2 Add more text (grow the vector corpus)
@@ -548,7 +547,7 @@ Steps:
 
 1. **Replace the text corpus.** Put your text file anywhere; point `OSCAR_TEXT_FILE` in `.env` at it (default is `ontology/oscar.txt`). One paragraph per non-empty line becomes one chunk.
 2. **Load new triples into GraphDB.** Either create a fresh repository (§6.1) or import into the existing one (§6.3). The source file can live anywhere on your machine — GraphDB reads it during import and copies it into its own storage. You don't need to keep the file in this repo afterward.
-3. **Write a matching schema TTL** for the LLM. Copy `ontology/oscar_schema.ttl` as a template; declare the classes and properties of your new domain, ideally with `rdfs:label` / `rdfs:comment` / `rdfs:domain` / `rdfs:range` — the LLM leans on these to write good SPARQL. This one **does** need to live in the repo (or wherever `GRAPHDB_ONTOLOGY_FILE` points).
+3. **Write a matching ontology file** for the LLM. Copy `ontology/oscars.trig` as a template; declare the classes and properties of your new domain in the T-Box section (ideally with `rdfs:label` / `rdfs:comment` / `rdfs:domain` / `rdfs:range` — the LLM leans on these to write good SPARQL). This one **does** need to live in the repo (or wherever `GRAPHDB_ONTOLOGY_FILE` points).
 4. **Update `.env`:**
     - `GRAPHDB_REPOSITORY` → the GraphDB repo holding the new triples
     - `GRAPHDB_ONTOLOGY_FILE` → path to your new schema TTL
@@ -559,6 +558,30 @@ Steps:
 6. **Restart** the Flask app (`./run.sh`) so `build_chain()` picks up the new schema.
 
 No source code change is required — everything the pipeline needs comes from `.env`, the schema TTL, and the text file.
+
+### 14.4 Preparing your data to help the LLM
+
+The pipeline's answer quality follows directly from how well you shape the data. A short checklist by pipeline:
+
+**For Graph RAG (`.trig` files) — help the LLM write good SPARQL:**
+
+- **Type every individual with `rdf:type`.** `?f a :Film` is the most natural pattern the LLM knows.
+- **Give every class and property an `rdfs:label`** — the LLM matches user words to labels.
+- **Add an `rdfs:comment`** on anything non-obvious (edge cases, conventions, sub-properties).
+- **Use `rdfs:domain` / `rdfs:range` on properties** — these carry the strongest hints about what connects to what.
+- **Keep one consistent namespace** matching `GRAPHDB_NAMESPACE` in `.env`. Mixed namespaces confuse both the LLM and reasoners.
+- **Give categorical IRIs an `rdfs:label`** (e.g. `:BestPicture rdfs:label "Best Picture"`) so filter-style questions like *"who won Best Picture?"* work naturally.
+- **Prefer human-readable local names** (`:MichaelBJordan`, not `:person_47`). The LLM often uses them verbatim in queries.
+- **Group individuals inside one named graph** so you can query, drop, or version them together.
+
+**For Text RAG (`oscar.txt`) — help retrieval find the right chunk:**
+
+- **One topic per non-empty line.** Each line becomes one embedded chunk. Blank lines are ignored.
+- **Make each chunk self-contained** — repeat the film / entity name inside the chunk instead of using pronouns. Retrieval sees each chunk in isolation; without the name it can't be matched to a question about that entity.
+- **Include key entity names verbatim** (film titles, character names, actor names). They're the anchors semantic search leans on.
+- **Keep chunks roughly 50–200 words.** Long enough to carry meaning; short enough for the LLM to reason over the top-K set without losing context.
+- **Don't paste tabular / structured data as prose** (award tables, cast lists) — that's what the graph is for. Text should describe things narratively.
+- **Refresh the index after every edit** — `python -m src.ingest_text` wipes and rebuilds the Weaviate collection.
 
 ---
 
@@ -582,9 +605,7 @@ LLM-Applications-UniCA/
 │   └── ingest_text.py         # One-shot: load oscar.txt into Weaviate
 │
 ├── ontology/
-│   ├── oscars2026.trig        # Knowledge graph (winners, nominations, milestones)
-│   ├── award_labels.trig      # rdfs:label for each award category
-│   ├── oscar_schema.ttl       # Ontology the LLM reads to write SPARQL
+│   ├── oscars.trig            # Full ontology + dataset (schema T-Box + individuals A-Box)
 │   └── oscar.txt              # Text corpus (film plots, cast, production)
 │
 ├── templates/                 # Jinja templates (Flask + Bootstrap)
@@ -609,7 +630,7 @@ them top-to-bottom to understand the flow.
 | Weaviate 404 on `/v1/meta`                          | Container not started or crashed                     | `docker compose logs weaviate`                                         |
 | `model 'qwen2.5-coder:7b' not found (404)`          | Ollama model not pulled                              | `ollama pull qwen2.5-coder:7b`                                         |
 | `/ask/graph` returns 502 "SPARQL query is invalid"  | Small LLM produced malformed SPARQL                  | Rephrase the question, or switch to a larger model                     |
-| `/ask/graph` answer says "I don't have information" | SPARQL ran but returned zero rows                    | Check that predicates in `oscar_schema.ttl` match what's in the trig   |
+| `/ask/graph` answer says "I don't have information" | SPARQL ran but returned zero rows                    | Check that predicates in `ontology/oscars.trig` schema match individuals |
 | `/ask/text` returns 502 "collection not found"      | Weaviate collection empty                            | Run `python -m src.ingest_text`                                        |
 | Port `:7200` already in use                         | Native GraphDB + something else on 7200              | Stop the other; keep only GraphDB                                      |
 | Port `:5000` already in use                         | Old `wsgi.py` still running / macOS AirPlay Receiver | Kill it (`lsof -i :5000` then `kill <pid>`) or change `PORT` in `.env` |
