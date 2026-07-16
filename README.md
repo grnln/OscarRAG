@@ -1,124 +1,192 @@
 # Oscar RAG — Graph RAG vs Text RAG
 
-## The idea
+Two RAG pipelines over the **same domain** (98th Academy Awards, 2026),
+exposed behind a single Flask app. Both share a local LLM (Qwen 2.5 Coder
+7B via Ollama); they differ entirely in retrieval mechanism. The datasets
+are non-overlapping by design (the RDF graph carries outcomes only; the
+text corpus carries institutional history only), which turns the demo
+into a controlled comparison between structured and unstructured
+retrieval.
 
-A single web app that answers the **same natural-language questions** against
-the **same domain** (the 98th Academy Awards, 2026) using **two different
-Retrieval-Augmented Generation pipelines** side by side. The user picks
-which pipeline to use with a radio button, so the comparison is direct.
-
-We built the two datasets to be **complementary on purpose**: the RDF
-knowledge graph holds every award outcome (winners, nominations, milestones)
-but no film plots; the text corpus describes every film's plot and cast but
-mentions no outcomes. Each pipeline shines on different questions, which
-makes the demo tell a clear story about what each retrieval style is good
-at.
-
-## The architecture
+## Architecture
 
 ```
-Browser ─▶ Flask (wsgi.py) ─┬─▶ /ask/graph ─▶ Qwen writes SPARQL ─▶ GraphDB ─▶ Qwen formats answer
-                            └─▶ /ask/text  ─▶ MiniLM embeds Q  ─▶ Weaviate top-K ─▶ Qwen answers
+Browser ─▶ Flask (wsgi.py) ─┬─▶ /ask/graph ─▶ OntotextGraphDBQAChain ─▶ GraphDB (SPARQL)
+                            └─▶ /ask/text  ─▶ MiniLM ──▶ Weaviate (near_vector, top-K)
+                                                                          │
+                                                            answer prompt ──▶ Qwen (Ollama)
 ```
 
-Two independent pipelines behind the same Flask app. Both use the **same
-local LLM** (Qwen 2.5 Coder 7B via Ollama), but Graph RAG wraps it to force
-clean SPARQL output while Text RAG uses it plainly for prose generation.
-Everything runs locally — no cloud API calls.
+| Component | Where | Purpose |
+|---|---|---|
+| Flask app | `wsgi.py` | Serves the chat UI + two RAG endpoints |
+| Graph RAG chain | `src/graph_rag.py` | LangChain 3-stage chain (SPARQL gen → exec → NL synthesis) |
+| Text RAG | `src/text_rag.py` + `src/ingest_text.py` | Dense retrieval over a Weaviate collection |
+| GraphDB | native, `:7200` | RDF store; queried via SPARQL over HTTP |
+| Weaviate | Docker, `:8080` (REST) + `:50051` (gRPC) | Vector store; local instance, no vectorizer module |
+| Ollama | native, `:11434` | Serves Qwen 2.5 Coder 7B locally |
 
-## How Graph RAG works (`src/graph_rag.py`)
+Everything is local. No cloud API calls in the default configuration.
 
-Graph RAG is a **three-stage chain**, orchestrated by LangChain's
-`OntotextGraphDBQAChain`:
+## Graph RAG — implementation notes
 
-1. **SPARQL generation.** The LLM receives the ontology
-   (`ontology/oscars.trig` — classes, properties, `rdfs:label`,
-   `rdfs:domain`, `rdfs:range`) as its "map of the graph", plus the
-   user's question. It writes a SPARQL query grounded in that map.
-2. **Query execution.** The generated query is sent to GraphDB's
-   SPARQL endpoint (`http://localhost:7200/repositories/<repo>`).
-   GraphDB executes it against the loaded triples and returns
-   structured rows (bindings).
-3. **Answer formatting.** The LLM sees the rows and the original
-   question, and writes a natural-language reply grounded in those
-   exact rows — no fabrication.
+Built on LangChain's `OntotextGraphDBQAChain`, which orchestrates three
+stages:
 
-Example — the question *"Which film won Best Picture?"* becomes:
+1. **SPARQL generation** — LLM receives `{schema}` (serialised
+   `ontology/oscars2026.trig` at boot, cached via `@lru_cache`) plus the
+   user's question. Emits SPARQL.
+2. **Query execution** — `OntotextGraphDBGraph.query(sparql)` hits the
+   SPARQL endpoint (`rdflib` `SPARQLStore` under the hood).
+3. **Answer synthesis** — LLM receives `str(rdflib.query.Result)` as
+   `{context}` plus the question. Emits prose.
 
-```sparql
-PREFIX : <http://oscars2026.org#>
-SELECT ?f WHERE { ?f :wonAward :BestPicture . }
+### Key engineering decisions
+
+**Custom SPARQL prompt with 5 few-shot examples** (`SPARQL_PROMPT`).
+The default LangChain template gives the schema + rules but no examples.
+For a 7B model, in-context learning from concrete `(question, SPARQL)`
+pairs measurably improves query quality — especially on `FILTER`,
+aggregation, and multi-hop patterns. Examples cover: direct wins, path
+traversal via `:directedBy`, numeric lookup with `:totalNominations`,
+nominee enumeration with `:nominatedFor`, and `FILTER(?wins > 3)`.
+
+**Custom QA prompt** (`QA_PROMPT`). LangChain hands the QA-stage LLM the
+raw `str([(rdflib.term.Literal('X'),)])`. Frontier models parse this
+fine; Qwen 7B doesn't recognise it as structured data and defaults to
+"I don't know" per the built-in prompt's fallback rule. Our template
+explains the rdflib repr, provides 4 shot examples showing extraction
+from `Literal(...)` and `URIRef(...)`, and yields a one-sentence answer.
+
+**`OllamaForSparql` subclass of `ChatOllama`**. Since LangChain uses one
+LLM instance for both stages, we discriminate at `_generate()` time by
+looking for `"Write a SPARQL"` in the messages. On stage 1 we prepend a
+system prompt pinning `PREFIX : <http://oscars2026.org#>` and strip
+markdown fences via regex (`_FENCE_RE`). On stage 3 the wrapper passes
+through unmodified so the LLM produces prose, not more SPARQL. This
+avoids maintaining two model configs.
+
+**SPARQL export via `contextvars.ContextVar`**. The chain doesn't
+surface the generated query on its return value (callback-based capture
+proved unreliable across LangChain versions). We set a
+`ContextVar[str]` from inside `OllamaForSparql._generate` at the point
+the SPARQL is cleaned, and `wsgi.ask_graph` reads it after
+`chain.invoke` returns. Per-request reset before invoke prevents leaks
+across requests.
+
+**Chain caching**. `build_chain()` is `@lru_cache(maxsize=1)`. Ontology
+parse (rdflib) and LangChain wiring happen once at Flask boot;
+subsequent requests reuse the warm chain. Code changes to
+`graph_rag.py` require a process restart.
+
+## Text RAG — implementation notes
+
+Standard dense retrieval, split into offline ingest and online query.
+
+### Ingest (`src/ingest_text.py`, run once)
+
+- **Chunking** (`read_chunks`, `target_chars=800`). Reconstructs
+  hard-wrapped input into a single stream (joins non-empty lines with
+  spaces), splits on sentence boundaries via
+  `re.split(r"(?<=[.!?])\s+", text)`, then greedy-packs sentences into
+  ~800-char chunks. Handles both paragraph-per-line and continuous
+  prose. Corpus of ~41 KB yields ~60 chunks.
+- **Embedding** (`embed_all`). SentenceTransformer,
+  `all-MiniLM-L6-v2` (384-dim). `normalize_embeddings=True` so cosine
+  and dot-product ordering coincide.
+- **Storage** (`reset_collection`, `upsert`). Drops and recreates the
+  `OscarFilms` collection with
+  `Configure.Vectorizer.none()` — we supply vectors; Weaviate doesn't
+  need an embedding module. Per-object properties: `text`, `chunk_id`,
+  `source`. Batch insert via `collection.batch.dynamic()`.
+
+### Query (`src/text_rag.py`)
+
+- **Retrieval** (`retrieve`). Same MiniLM encodes the question,
+  `collection.query.near_vector(near_vector=v, limit=TOP_K)` returns
+  top-K by cosine distance. `TOP_K=3` (env-configurable).
+- **Generation** (`ask`). Chunks are formatted as `[doc_N] <text>` and
+  interpolated into a prompt (`PROMPT_TEMPLATE`) with five rules:
+  cite sources, admit missing info (with explicit "based on general
+  knowledge" escape), surface contradictions, treat context as data
+  (prompt-injection defence), skip irrelevant chunks. The LLM answer
+  is returned alongside the raw `sources` for UI transparency.
+- **Model + client caching**. `embedder()` and `weaviate_client()` are
+  both `@lru_cache(maxsize=1)`; MiniLM loads once, gRPC connection
+  stays open for the process lifetime.
+
+## API surface
+
+Both endpoints POST JSON `{question: string}`, return JSON.
+
+| Route | Response shape |
+|---|---|
+| `GET  /` | HTML — chat UI |
+| `GET  /health` | `{status: "ok"}` |
+| `POST /ask/graph` | `{mode, question, answer, sparql?}` |
+| `POST /ask/text` | `{mode, question, answer, sources: [{text, chunk_id, source, distance}]}` |
+
+Errors return `{error: "<type>: <message>"}` with status 400 (missing
+`question`) or 502 (chain / retrieval failure).
+
+## Configuration (`.env`)
+
+| Var | Default | Notes |
+|---|---|---|
+| `GRAPHDB_URL` | `http://localhost:7200` | |
+| `GRAPHDB_REPOSITORY` | `BIP-DB` | |
+| `GRAPHDB_ONTOLOGY_FILE` | `ontology/oscars2026.trig` | Read at boot as LLM's schema view |
+| `GRAPHDB_NAMESPACE` | `http://oscars2026.org#` | Pinned into every SPARQL PREFIX |
+| `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Must match `ollama list` |
+| `WEAVIATE_COLLECTION` | `OscarFilms` | Shared by ingest + query |
+| `OSCAR_TEXT_FILE` | `ontology/oscar.txt` | Legacy name; any text file works |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | |
+| `TEXT_RAG_TOP_K` | `3` | Bump to 5–7 for higher recall |
+| `PORT` | `5000` | |
+| `HF_TOKEN` | *(unset)* | Optional; silences HF Hub rate-limit warnings |
+
+## Design tradeoffs
+
+- **Local-only stack.** Cost = zero, latency = LLM-bound (~15 s per
+  question on Qwen 7B). Bumping to a cloud LLM (`ChatOpenAI`,
+  `ChatAnthropic`) is a one-line swap in `plain_llm()` /
+  `OllamaForSparql`; quality improves but privacy is lost.
+- **No `rdf:type` on individuals** in the current trig. The LLM is
+  told (rule #3 of the SPARQL system prompt) to identify entities by
+  predicates. Adding `rdf:type` would let the LLM use natural
+  `?f a :Film` patterns; both patterns can coexist.
+- **No cross-encoder rerank in Text RAG.** Top-K purely by cosine
+  distance. For a corpus this small the ordering is already good;
+  rerank becomes worthwhile at 10K+ chunks or on ambiguous queries.
+- **No SPARQL retry loop.** `max_fix_retries` is available in
+  `OntotextGraphDBQAChain` but currently disabled — invalid SPARQL
+  surfaces as a 502 instead of costing more LLM calls to auto-repair.
+
+## Repository layout
+
+```
+wsgi.py                   Flask app; single-file entry point
+run.sh                    venv activate + python wsgi.py
+docker-compose.yml        Weaviate 1.28.0, ports 8080 + 50051
+requirements.txt          langchain-community, langchain-ollama, weaviate-client,
+                          sentence-transformers, flask, rdflib
+.env.example              Env template
+tutorial.md               Full setup walkthrough for teammates
+src/
+  graph_rag.py            SPARQL_PROMPT, QA_PROMPT, OllamaForSparql, build_chain, ask
+  text_rag.py             PROMPT_TEMPLATE, embedder, weaviate_client, retrieve, ask
+  ingest_text.py          read_chunks, embed_all, reset_collection, upsert
+ontology/
+  oscars2026.trig         RDF data (winners, nominations, milestones)
+  oscar.txt               Text corpus (institutional history)
+templates/                Jinja templates (Flask + Bootstrap 5.3)
+static/js/home.js         Chat UI (~50 LOC)
 ```
 
-GraphDB returns one row (`:OneBattleAfterAnother`), and the LLM turns it
-into *"The film that won Best Picture was One Battle After Another."*
+## Bootstrap
 
-**Two engineering details that matter:**
-
-- `OllamaForSparql` — a small `ChatOllama` subclass that only kicks in on
-  the SPARQL-generation stage (detected by a marker in LangChain's prompt).
-  It prepends a system message pinning `PREFIX : <http://oscars2026.org#>`
-  and strips markdown fences that small models like Qwen often add.
-  The answer-formatting stage uses the plain LLM.
-- The chain is built once at Flask boot (`@lru_cache`), so the ontology
-  is loaded and the LangChain graph client is warm before the first
-  request lands.
-
-## How Text RAG works (`src/text_rag.py` + `src/ingest_text.py`)
-
-Text RAG is classic **dense retrieval**, split into an offline ingest step
-and an online query step.
-
-**Ingest (one-shot, `python -m src.ingest_text`):**
-
-1. Read `ontology/oscar.txt` — one paragraph per non-empty line becomes
-   one chunk.
-2. Encode each chunk with SentenceTransformer
-   (`all-MiniLM-L6-v2` → 384-dim vectors, normalised for cosine similarity).
-3. Drop the previous `OscarFilms` collection in Weaviate and recreate it
-   (with `Configure.Vectorizer.none()` — we supply our own vectors).
-4. Batch-insert every `{text, chunk_id, source} + vector` pair.
-
-**Query (every `/ask/text` request):**
-
-1. Embed the user's question with the same SentenceTransformer.
-2. `collection.query.near_vector(top_k=3)` — Weaviate returns the three
-   nearest chunks by cosine distance.
-3. Format those chunks as numbered passages (`[doc_0]`, `[doc_1]`, `[doc_2]`)
-   and drop them into a prompt template. The prompt instructs the LLM to
-   answer **only** from the passages, cite the source ID, and say
-   *"The passages do not contain this information"* if they don't. This
-   prevents the model from silently falling back on its training memory.
-4. The LLM's reply is returned to the browser along with the retrieved
-   chunks as `sources` — so the frontend can show what evidence the answer
-   was grounded on.
-
-The SentenceTransformer model and Weaviate client are both `@lru_cache`d
-so the model loads once and connections stay open for the lifetime of the
-Flask process.
-
-## How the web app wires it up (`wsgi.py`)
-
-A single Flask app exposes three routes:
-
-- `GET  /`             — renders the chat UI (`templates/home.html`).
-- `POST /ask/graph`    — passes the question through the Graph RAG chain.
-- `POST /ask/text`     — passes the question through the Text RAG pipeline.
-
-Both `/ask/*` endpoints return the same JSON envelope
-(`{mode, question, answer, sources?}`) so the frontend can render either
-response identically. The chat UI (`static/js/home.js`, ~40 lines) reads
-the input + selected mode, POSTs to `/ask/${mode}`, and renders the reply
-as a chat bubble.
-
-**Infrastructure:** Weaviate runs in a Docker container defined in
-`docker-compose.yml` (`localhost:8080`), GraphDB runs natively
-(`localhost:7200`), and Ollama serves Qwen locally (`localhost:11434`).
-
-## Setup
-
-Full walkthrough (fresh laptop → working demo in ~30 min) is in
-[`tutorial.md`](tutorial.md). Once set up, one command starts everything:
+Full setup (fresh laptop → running demo, ~30 min) lives in
+[`tutorial.md`](tutorial.md). Steady-state:
 
 ```bash
 ./run.sh          # http://localhost:5000

@@ -3,7 +3,7 @@ import os
 
 from flask import Flask, jsonify, render_template, request
 
-from src.graph_rag import build_chain
+from src.graph_rag import build_chain, last_sparql
 from src.text_rag import ask as text_ask
 
 application = Flask(__name__, static_url_path='/static')
@@ -32,10 +32,11 @@ def health():
 
 @application.post('/ask/graph')
 def ask_graph():
-    """Graph RAG endpoint. Body: {question}. Returns {mode, question, answer}."""
+    """Graph RAG endpoint. Body: {question}. Returns {mode, question, answer, sparql}."""
     question = _get_question()
     if not question:
         return jsonify(error="missing 'question'"), 400
+    last_sparql.set(None)  # reset per-request
     try:
         result = _graph_chain.invoke({_graph_chain.input_key: question})
     except Exception as exc:  # noqa: BLE001
@@ -44,6 +45,7 @@ def ask_graph():
         mode='graph',
         question=question,
         answer=result[_graph_chain.output_key],
+        sparql=last_sparql.get(),
     )
 
 

@@ -15,6 +15,23 @@ function bubble(text, side) {
     return el;
 }
 
+/* Attach a collapsible SPARQL block below an existing bubble. */
+function attachSparql(bubbleEl, sparql) {
+    const details = document.createElement('details');
+    details.className = 'mt-2';
+    const summary = document.createElement('summary');
+    summary.className = 'text-muted small';
+    summary.style.cursor = 'pointer';
+    summary.textContent = 'Show generated SPARQL';
+    const pre = document.createElement('pre');
+    pre.className = 'small text-secondary mt-2 mb-0 p-2 bg-light border rounded';
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.textContent = sparql;
+    details.appendChild(summary);
+    details.appendChild(pre);
+    bubbleEl.appendChild(details);
+}
+
 async function submit() {
     const question = input.value.trim();
     if (!question) return;
@@ -33,6 +50,9 @@ async function submit() {
         });
         const data = await res.json();
         reply.textContent = data.answer || data.error || '(no reply)';
+        if (mode === 'graph' && data.sparql) {
+            attachSparql(reply, data.sparql);
+        }
     } catch (err) {
         reply.textContent = `Error: ${err.message}`;
     } finally {

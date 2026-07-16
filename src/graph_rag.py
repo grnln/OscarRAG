@@ -5,21 +5,142 @@ formats the resulting rows into a natural-language answer.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 from functools import lru_cache
+
+# Set by OllamaForSparql at the end of every SPARQL-generation call.
+# wsgi.ask_graph reads this to include the query in the JSON response.
+last_sparql: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "last_sparql", default=None
+)
 
 from dotenv import load_dotenv
 from langchain_community.chains.graph_qa.ontotext_graphdb import OntotextGraphDBQAChain
 from langchain_community.graphs import OntotextGraphDBGraph
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration
+from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama
 
 load_dotenv()
 
 # Small models like to wrap SPARQL in ```sparql ... ``` fences. This strips them.
 _FENCE_RE = re.compile(r"^```(?:sparql)?\s*\n?|\n?```\s*$", re.MULTILINE)
+
+# Few-shot prompt for SPARQL generation. Overrides LangChain's default template.
+# Concrete examples teach small LLMs (like Qwen 7B) our query patterns better
+# than any amount of rule text.
+SPARQL_PROMPT = PromptTemplate(
+    input_variables=["schema", "prompt"],
+    template="""Write a SPARQL SELECT query for the RDF graph described by the schema below.
+
+Ontology schema (Turtle):
+```
+{schema}
+```
+
+Rules:
+- Use only classes and properties from the schema.
+- Include PREFIX declarations at the top.
+- Individuals in this dataset are NOT typed with rdf:type. Identify entities
+  by the predicates they use (e.g. films by :directedBy, people by rdfs:label).
+- Prefer direct IRIs (e.g. :BestPicture) over string label filters when possible.
+- Return ONLY the SPARQL query — no markdown, no explanation.
+
+Examples:
+
+Question: Who won Best Picture?
+SPARQL:
+PREFIX : <http://oscars2026.org#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?title WHERE {{
+  ?film :wonAward :BestPicture ;
+        rdfs:label ?title .
+}}
+
+Question: Which films did Ryan Coogler direct?
+SPARQL:
+PREFIX : <http://oscars2026.org#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?title WHERE {{
+  ?film :directedBy :RyanCoogler ;
+        rdfs:label ?title .
+}}
+
+Question: How many nominations did Sinners get?
+SPARQL:
+PREFIX : <http://oscars2026.org#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?n WHERE {{
+  ?film rdfs:label "Sinners" ;
+        :totalNominations ?n .
+}}
+
+Question: Who was nominated for Best Actor?
+SPARQL:
+PREFIX : <http://oscars2026.org#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?name WHERE {{
+  ?nominee :nominatedFor :BestActor ;
+           rdfs:label ?name .
+}}
+
+Question: Which films won more than 3 awards?
+SPARQL:
+PREFIX : <http://oscars2026.org#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?title ?wins WHERE {{
+  ?film :totalWins ?wins ;
+        rdfs:label ?title .
+  FILTER(?wins > 3)
+}}
+
+Question: {prompt}
+SPARQL:""",
+)
+
+# QA prompt for stage 3 — turns rdflib-formatted SPARQL rows into a clean answer.
+# LangChain's default expects a "well-formatted context" but our rows arrive as
+# `[(rdflib.term.Literal('X'),)]`. Small models choke on that unless we spell it out.
+QA_PROMPT = PromptTemplate(
+    input_variables=["context", "prompt"],
+    template="""Generate a natural-language answer using ONLY the SPARQL query results below.
+
+The results may look like Python rdflib objects (e.g. `[(rdflib.term.Literal('X'),)]`
+or `[(rdflib.term.URIRef('http://…#Something'),)]`). Extract the string values
+(the text inside `Literal(...)`, or the local name after the last `#` in a URI).
+
+Rules:
+- Base your answer strictly on the results. Do NOT use general knowledge.
+- If the results are empty (`[]`), say you don't have that information.
+- Answer in one clear, natural sentence.
+
+Examples:
+
+Results: [(rdflib.term.Literal('Ryan Coogler'),)]
+Question: Who directed Sinners?
+Answer: Ryan Coogler directed Sinners.
+
+Results: [(rdflib.term.Literal('One Battle After Another'),)]
+Question: Which film won Best Picture?
+Answer: One Battle After Another won Best Picture.
+
+Results: [(rdflib.term.URIRef('http://oscars2026.org#PaulThomasAnderson'),)]
+Question: Who won Best Director?
+Answer: Paul Thomas Anderson won Best Director.
+
+Results: []
+Question: Who won Best Editing?
+Answer: I don't have that information.
+
+Results:
+{context}
+
+Question: {prompt}
+Answer:""",
+)
 
 
 def clean_sparql(text: str) -> str:
@@ -63,6 +184,9 @@ class OllamaForSparql(ChatOllama):
             gen.message = AIMessage(content=cleaned)
             if isinstance(gen, ChatGeneration):
                 gen.text = cleaned
+        # Expose the cleaned SPARQL so the API layer can return it in the response.
+        if result.generations:
+            last_sparql.set(result.generations[0].message.content)
         return result
 
 
@@ -81,7 +205,11 @@ def build_chain() -> OntotextGraphDBQAChain:
     )
     llm = OllamaForSparql(model=os.environ["OLLAMA_MODEL"], temperature=0)
     return OntotextGraphDBQAChain.from_llm(
-        llm=llm, graph=graph, allow_dangerous_requests=True,
+        llm=llm,
+        graph=graph,
+        sparql_generation_prompt=SPARQL_PROMPT,
+        qa_prompt=QA_PROMPT,
+        allow_dangerous_requests=True,
     )
 
 
