@@ -191,3 +191,33 @@ Full setup (fresh laptop → running demo, ~30 min) lives in
 ```bash
 ./run.sh          # http://localhost:5000
 ```
+
+## Security testing
+
+Jailbreak tests were performed on the assistant, using prompts that tried to make the assistant answer questions for which it was not designed.
+
+Some of the tests performed included:
+
+- Asking the assistant about awards won by someone who could not have been a recipient of an Academy Award, due to them not working in the field of cinema (such as a pop artist):
+
+![Screenshot 1](images/screenshot_1.png)
+
+- Trying to ask the assistant about topics not related to cinema or the academy awards (by contradicting its instructions):
+
+![Screenshot 2](images/screenshot_2.png)
+
+- Trying to make the assistant discard all instructions (by telling them they are an unfiltered assistant) and asking it about topics that do not appear on the document corpus:
+
+![Screenshot 3](images/screenshot_3.png)
+
+These tests were performed on the text RAG, as the graph RAG can only answer questions pertaining to the information stored in the knowledge graph.
+
+These tests failed due to a lack of prior instructions inserted in the prompt that would allow the model to distinguish between topics that were covered in the document corpus and those that were not.
+
+### Actions taken
+
+A cross-encoder was added to filter the chunks of text that were fed to the assistant, so as to avoid answering questions that do not pertain to the contents of the document corpus.
+
+![Screenshot 4](images/screenshot_4.png)
+
+As can be seen in the image abbove, the assistant is now able to filter the prompts and not answer questions that are not related to the contents of the document corpus.
