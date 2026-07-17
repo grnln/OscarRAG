@@ -220,4 +220,4 @@ A cross-encoder was added to filter the chunks of text that were fed to the assi
 
 ![Screenshot 4](images/screenshot_4.png)
 
-As can be seen in the image abbove, the assistant is now able to filter the prompts and not answer questions that are not related to the contents of the document corpus.
+As can be seen in the image above, the assistant is now able to filter the prompts and not answer questions that are not related to the contents of the document corpus.
